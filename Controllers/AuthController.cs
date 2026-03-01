@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.EntityFrameworkCore;
 using NSprob.Server.Data;
 using NSprob.Server.Services;
@@ -115,7 +117,59 @@ namespace NSprob.Server.Controllers
         }
     }
 
+
+        // POST /api/auth/request-delete
+        [HttpPost("request-delete")]
+        [Authorize]
+        public async Task<IActionResult> RequestDelete()
+        {
+            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            var user   = await _db.Users.FindAsync(userId);
+            if (user == null) return NotFound();
+
+            var code = RandomNumberGenerator.GetInt32(100_000, 999_999).ToString();
+            var old = _db.PendingVerifies.Where(p => p.Email == user.Email);
+            _db.PendingVerifies.RemoveRange(old);
+            _db.PendingVerifies.Add(new PendingVerify {
+                Email = user.Email, Username = user.Username, PublicKey = "",
+                Code = code, ExpiresAt = DateTime.UtcNow.AddMinutes(15)
+            });
+            await _db.SaveChangesAsync();
+
+            try { await _email.SendVerificationAsync(user.Email, user.Username, code); }
+            catch {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"\n  [DEBUG] Delete code for {user.Email}: {code}\n");
+                Console.ResetColor();
+            }
+            return Ok();
+        }
+
+        // POST /api/auth/delete-account
+        [HttpPost("delete-account")]
+        [Authorize]
+        public async Task<IActionResult> DeleteAccount([FromBody] DeleteReq req)
+        {
+            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            var user   = await _db.Users.FindAsync(userId);
+            if (user == null) return NotFound();
+
+            var pending = await _db.PendingVerifies.FirstOrDefaultAsync(p =>
+                p.Email == user.Email && p.Code == req.Code && p.ExpiresAt > DateTime.UtcNow);
+            if (pending == null) return BadRequest("Invalid or expired code.");
+
+            var convos = _db.Conversations.Where(c => c.User1Id == userId || c.User2Id == userId);
+            foreach (var c in convos)
+                _db.Messages.RemoveRange(_db.Messages.Where(m => m.ConversationId == c.Id));
+            _db.Conversations.RemoveRange(convos);
+            _db.PendingVerifies.RemoveRange(_db.PendingVerifies.Where(p => p.Email == user.Email));
+            _db.Users.Remove(user);
+            await _db.SaveChangesAsync();
+            return Ok();
+        }
+
     public record RegisterReq(string Username, string Email, string PublicKey);
     public record VerifyReq(string Email, string Code);
     public record LoginReq(string Email, string Password);
+    public record DeleteReq(string Code, string Password);
 }
